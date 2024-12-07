@@ -1,117 +1,134 @@
 #include "server.hpp"
 
 #include <arpa/inet.h>
+#include <cstring>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
 
-const int MAX_BUFFER = 1024;
-const int MAX_CONN = 20;
-void log(const std::string &message) { std::cout << message << std::endl; }
-std::string logSocket(sockaddr_in &s) {
-  return "\n[IP Address] " + std::string(inet_ntoa(s.sin_addr)) + '\n' +
-         "[PORT] " + std::to_string(ntohs(s.sin_port));
-}
-void errorExit(const std::string &error) {
-  log(error);
-  exit(1);
+namespace {
+void log(const std::string &message) {
+  std::cout << "[SERVER] " << message << std::endl;
 }
 
-Server::Server(std::string ipAddress, int port) : port(port), socketAddress() {
+std::string formatSocketInfo(const sockaddr_in &addr) {
+  return std::string("\n[IP Address] ") + inet_ntoa(addr.sin_addr) +
+         "\n[PORT] " + std::to_string(ntohs(addr.sin_port));
+}
+} // namespace
+
+Server::Server(std::string ipAddress, int port) : port(port), isRunning(false) {
   socketAddress.sin_family = AF_INET;
   socketAddress.sin_port = htons(port);
   socketAddress.sin_addr.s_addr = inet_addr(ipAddress.c_str());
   socketLength = sizeof(socketAddress);
 
-  std::ostringstream oss;
+  registerHandler("/", []() {
+    return "<html><body><h1>Welcome to Basic HTTP Server</h1></body></html>";
+  });
 
-  if (!start()) {
-    oss << "Server failed to start." << logSocket(socketAddress);
-    log(oss.str());
-    return;
+  serverFd = socket(AF_INET, SOCK_STREAM, 0);
+  if (serverFd < 0) {
+    throw std::runtime_error("Socket creation failed.");
   }
 
-  oss << "Server started successfully." << logSocket(socketAddress);
-  log(oss.str());
-}
-
-Server::~Server() { closeserver(); }
-
-int Server::start() {
-  sfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sfd < 0) {
-    errorExit("Socket creation failed.");
-    return 1;
-  }
   int reuse = 1;
-  if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&reuse, sizeof(reuse)) <
+  if (setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
       0) {
-    errorExit("Socket options failed.");
-    return 1;
+    close(serverFd);
+    throw std::runtime_error("Failed to set socket options.");
   }
-  if (bind(sfd, (struct sockaddr *)&socketAddress, socketLength) < 0) {
-    errorExit("Socket binding failed.");
-    return 1;
+
+  if (bind(serverFd, reinterpret_cast<struct sockaddr *>(&socketAddress),
+           socketLength) < 0) {
+    close(serverFd);
+    throw std::runtime_error("Socket binding failed");
   }
-  return 0;
+
+  log("Server initialised successfully." + formatSocketInfo(socketAddress));
 }
 
-void Server::startlisten() {
-  std::ostringstream oss;
-  if (listen(sfd, MAX_CONN) < 0) {
-    oss << "Server failed to listen." << logSocket(socketAddress);
-    errorExit(oss.str());
+Server::~Server() { closeServer(); }
+
+void Server::registerHandler(const std::string &path,
+                             std::function<std::string(void)> handler) {
+  pathHandlers[path] = std::move(handler);
+}
+
+void Server::start() {
+  if (listen(serverFd, MAX_CONNECTIONS) < 0) {
+    throw std::runtime_error("Failed to start listening.");
   }
-  oss << "Server is listening." << logSocket(socketAddress);
-  log(oss.str());
 
-  while (1) {
-    acceptconn();
-    char buffer[MAX_BUFFER] = {0};
-    int bytes = read(cfd, buffer, MAX_BUFFER);
+  log("Server is listening." + formatSocketInfo(socketAddress));
+  isRunning = true;
 
-    std::ostringstream ss;
-
-    if (bytes < 0) {
-      oss << "Error encountered during reading.";
-      errorExit(oss.str());
-    }
-
-    {
-      oss << "Client read successfully.";
-      log(oss.str());
-    }
-
-    sendresponse();
-    close(cfd);
+  while (isRunning) {
+    acceptConnection();
+    handleConnection();
+    close(clientFd);
   }
 }
 
-void Server::acceptconn() {
-  cfd = accept(sfd, (struct sockaddr *)&socketAddress,
-               (socklen_t *)&socketLength);
-  if (cfd < 0) {
-    std::ostringstream oss;
-    oss << "Error encountered in accepting client connection.";
-    errorExit(oss.str());
+void Server::acceptConnection() {
+  clientFd =
+      accept(serverFd, reinterpret_cast<struct sockaddr *>(&socketAddress),
+             &socketLength);
+  if (clientFd < 0) {
+    throw std::runtime_error("Failed to accept client connection.");
   }
 }
 
-void Server::sendresponse() {
-  std::string response = "HTTP/1.1 200 OK\r\n\r\n";
-  long bytesSent = write(cfd, response.c_str(), response.size());
-  std::ostringstream oss;
-  if (bytesSent == response.size()) {
-    oss << "Wrote to client successfully.";
-    log(oss.str());
+std::string Server::parseRequestPath(const std::string &request) {
+  std::istringstream iss(request);
+  std::string method, path, protocol;
+  iss >> method >> path >> protocol;
+  return path;
+}
+
+void Server::handleConnection() {
+  char buffer[MAX_BUFFER] = {0};
+  ssize_t bytesRead = read(clientFd, buffer, MAX_BUFFER - 1);
+
+  if (bytesRead < 0) {
+    throw std::runtime_error("Error reading from client");
+  }
+
+  std::string request(buffer);
+  std::string path = parseRequestPath(request);
+
+  std::string content;
+  if (pathHandlers.count(path) > 0) {
+    content = pathHandlers[path]();
   } else {
-    oss << "Error writing to client";
-    errorExit(oss.str());
+    content = "<html><body><h1>404 Not Found</h1></body></html>";
   }
+
+  std::string response = "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/html\r\n"
+                         "Content-Length: " +
+                         std::to_string(content.length()) +
+                         "\r\n"
+                         "\r\n" +
+                         content;
+
+  sendResponse(response);
 }
 
-void Server::closeserver() {
-  close(sfd);
-  close(cfd);
+void Server::sendResponse(const std::string &response) {
+  ssize_t bytesSent = write(clientFd, response.c_str(), response.length());
+  if (bytesSent != static_cast<ssize_t>(response.length())) {
+    throw std::runtime_error("Failed to send complete response.");
+  }
+  log("Response sent successfully.");
+}
+
+void Server::closeServer() {
+  isRunning = false;
+  if (serverFd >= 0)
+    close(serverFd);
+  if (clientFd >= 0)
+    close(clientFd);
 }
